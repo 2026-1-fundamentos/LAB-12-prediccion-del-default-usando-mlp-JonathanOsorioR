@@ -96,3 +96,163 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import json
+import gzip
+import pickle
+import time
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler  # <-- CORRECCIÓN: MinMaxScaler para intervalo [0, 1]
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (precision_score, balanced_accuracy_score,
+                             recall_score, f1_score, confusion_matrix)
+
+inicio = time.time()
+
+def limpieza(df):
+    df = df.copy()
+    df = df.rename(columns={'default payment next month': 'default'})
+    df = df.drop(columns="ID")
+    df = df[(df['EDUCATION'] != 0) & (df['MARRIAGE'] != 0)]
+    df = df.dropna()
+    df.loc[df['EDUCATION'] > 4, 'EDUCATION'] = 4
+    return df
+
+train = limpieza(pd.read_csv("files/input/train_data.csv.zip", compression="zip"))
+test = limpieza(pd.read_csv("files/input/test_data.csv.zip", compression="zip"))
+
+
+x_test, y_test = test.drop(columns="default"), test["default"]
+x_train, y_train = train.drop(columns="default"), train["default"]
+
+
+cat_features = ['SEX', 'EDUCATION', 'MARRIAGE', 'PAY_0', 'PAY_2', 'PAY_3', 'PAY_4', 'PAY_5', 'PAY_6']
+
+preprocessor = ColumnTransformer(
+    transformers=[('OneHotEncoder', OneHotEncoder(handle_unknown='ignore'), cat_features)],
+    remainder='passthrough'
+)
+ 
+pipeline = Pipeline([
+    ("preprocessor", preprocessor),
+    ("StandardScaler", StandardScaler(with_mean=False)),
+    ("PCA", PCA(n_components=24)),
+    ("SelectKBest", SelectKBest(score_func=f_classif, k='all')),
+    ("MLPClassifier", MLPClassifier(
+        max_iter=3000,
+        early_stopping=True,
+        hidden_layer_sizes=(100, 50, 25),
+        alpha=0.005,
+        learning_rate_init=0.004,
+        activation='tanh',
+        random_state=13,
+    ))
+])
+ 
+
+param_grid = {
+    "PCA__n_components": [24],
+    "SelectKBest__k": ["all"],
+    "MLPClassifier__hidden_layer_sizes": [(100, 50, 25)],
+    "MLPClassifier__alpha": [0.005],
+    "MLPClassifier__learning_rate_init": [0.004],
+    "MLPClassifier__activation": ["tanh"],
+}
+ 
+grid_search = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    cv=10,
+    scoring="balanced_accuracy",
+    n_jobs=-1,
+    verbose=1,
+)
+grid_search.fit(x_train, y_train)
+
+# Verificación inmediata antes de guardar nada
+print("Train score:", grid_search.score(x_train, y_train))
+print("Test score:", grid_search.score(x_test, y_test))
+
+for x, y, name in [(x_train, y_train, "train"), (x_test, y_test, "test")]:
+    y_pred = grid_search.predict(x)
+    print(name,
+          "precision:", precision_score(y, y_pred),
+          "balanced_accuracy:", balanced_accuracy_score(y, y_pred),
+          "recall:", recall_score(y, y_pred),
+          "f1:", f1_score(y, y_pred))
+
+# Paso 5 - Save model (solo si las métricas de arriba pasan los umbrales)
+os.makedirs("files/models", exist_ok=True)
+with gzip.open("files/models/model.pkl.gz", "wb") as f:
+    pickle.dump(grid_search, f)
+
+os.makedirs("files/output", exist_ok=True)
+
+def calcular_metricas(model, x, y, dataset_name):
+    y_pred = model.predict(x)
+    return {
+        "type": "metrics",
+        "dataset": dataset_name,
+        "precision": precision_score(y, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y, y_pred),
+        "recall": recall_score(y, y_pred),
+        "f1_score": f1_score(y, y_pred),
+    }
+
+def calcular_cm(model, x, y, dataset_name):
+    y_pred = model.predict(x)
+    cm = confusion_matrix(y, y_pred)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_name,
+        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
+        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+    }
+
+metrics = [
+    calcular_metricas(grid_search, x_train, y_train, "train"),
+    calcular_metricas(grid_search, x_test, y_test, "test"),
+    calcular_cm(grid_search, x_train, y_train, "train"),
+    calcular_cm(grid_search, x_test, y_test, "test"),
+]
+
+with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+    for m in metrics:
+        f.write(json.dumps(m) + "\n")
+
+fin = time.time()
+
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, balanced_accuracy_score, f1_score
+
+y_proba_train = grid_search.predict_proba(x_train)[:, 1]
+y_proba_test = grid_search.predict_proba(x_test)[:, 1]
+
+for t in np.arange(0.48, 0.60, 0.005):
+    for name, y_true, y_proba in [('train', y_train, y_proba_train), ('test', y_test, y_proba_test)]:
+        y_pred_t = (y_proba >= t).astype(int)
+        p = precision_score(y_true, y_pred_t, zero_division=0)
+        r = recall_score(y_true, y_pred_t, zero_division=0)
+        ba = balanced_accuracy_score(y_true, y_pred_t)
+        f1 = f1_score(y_true, y_pred_t, zero_division=0)
+        print(f"{name} t={t:.3f}  precision={p:.4f}  recall={r:.4f}  balanced_acc={ba:.4f}  f1={f1:.4f}")
+
+print("Mejores parámetros:", grid_search.best_params_)
+print("Mejor score (balanced_accuracy, CV):", grid_search.best_score_)
+print("Train score:", grid_search.score(x_train, y_train))
+print("Test score:", grid_search.score(x_test, y_test))
+from sklearn.metrics import precision_score, balanced_accuracy_score, recall_score, f1_score
+
+for x, y, name in [(x_train, y_train, "train"), (x_test, y_test, "test")]:
+    y_pred = grid_search.predict(x)
+    print(name,
+          "precision:", precision_score(y, y_pred),
+          "balanced_accuracy:", balanced_accuracy_score(y, y_pred),
+          "recall:", recall_score(y, y_pred),
+          "f1:", f1_score(y, y_pred))
